@@ -1,0 +1,324 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: action
+name: generate-release-manifest
+description: >
+  Resolve latest artifacts from CloudBees Release Orchestration API and emit a
+  SquidStack-style "release" manifest suitable for the Deploy CB Squidstack workflow.
+
+inputs:
+  cb_api_url:
+    required: true
+    description: Base URL for the CloudBees API (e.g. https://api.cloudbees.io)
+  cb_pat:
+    required: true
+    description: Personal access token for authenticating to the CloudBees API
+  org_id:
+    required: false
+    description: Optional organization ID for org-scoped component lookups
+  labels:
+    required: false
+    description: >
+      Comma-separated label filters to apply to artifacts, e.g. "rel=squid,ns=squid-demo-3".
+      These must match the `labels` array on artifacts (stored as "key=value" strings).
+  components_json:
+    required: true
+    description: |
+      JSON object describing components and their repo mapping, e.g.:
+
+        {
+          "kraken-auth": {
+            "component_id": "2dc859d8-f3e1-44ca-9160-6e86a8077aab",
+            "repo": "gururepservice/kraken-auth"
+          },
+          "squid-ui": {
+            "component_id": "0459d9f1-4f37-4db1-bfb4-e2e1731a0975",
+            "repo": "gururepservice/squid-ui"
+          }
+        }
+
+      - Keys are logical component names (e.g. "kraken-auth", "squid-ui")
+      - component_id is the CB component UUID
+      - repo is the docker repo name to embed under that component in the manifest
+  debug_level:
+    required: false
+    default: info
+    description: >
+      Logging verbosity. One of:
+        - "debug" : very chatty, logs all API calls and selection logic
+        - "info"  : default; high-level progress and final selection per component
+        - "timer" : only timing / call-count summary
+
+outputs:
+  manifest:
+    description: JSON-formatted release-style manifest (same structure as a release invocation sends)
+    value: ${{ steps.generate.outputs.manifest }}
+  stats:
+    description: JSON with basic timing and call statistics (per API group and overall)
+    value: ${{ steps.generate.outputs.stats }}
+
+runs:
+  using: composite
+  steps:
+    - id: generate
+      name: Generate release-style manifest
+      uses: docker://python:3.11-alpine
+      shell: sh
+      env:
+        CB_API_URL: ${{ inputs.cb_api_url }}
+        CB_PAT: ${{ inputs.cb_pat }}
+        ORG_ID: ${{ inputs.org_id }}
+        LABELS_INPUT: ${{ inputs.labels }}
+        COMPONENTS_JSON: ${{ inputs.components_json }}
+        DEBUG_LEVEL: ${{ inputs.debug_level }}
+      run: |
+        set -eu
+
+        apk add --no-cache curl > /dev/null
+
+        python - <<'PY'
+        import json
+        import os
+        import sys
+        import time
+        import urllib.request
+        import urllib.error
+
+        cb_api_url   = os.environ["CB_API_URL"].rstrip("/")
+        cb_pat       = os.environ["CB_PAT"]
+        components_s = os.environ["COMPONENTS_JSON"]
+        labels_s     = os.environ.get("LABELS_INPUT", "") or ""
+        org_id       = os.environ.get("ORG_ID") or ""
+        debug_level  = (os.environ.get("DEBUG_LEVEL") or "info").lower()
+
+        def log(level: str, msg: str):
+          levels = {"debug": 10, "info": 20, "timer": 30}
+          cur = levels.get(debug_level, 20)
+          want = levels.get(level, 20)
+          if want >= cur:
+            print(msg, file=sys.stderr)
+
+        # ---------- Parse components ----------
+        try:
+          components = json.loads(components_s or "{}")
+        except Exception as e:
+          print(f"components_json is not valid JSON: {e}", file=sys.stderr)
+          sys.exit(1)
+
+        if not isinstance(components, dict) or not components:
+          print("components_json must be a non-empty JSON object", file=sys.stderr)
+          sys.exit(1)
+
+        # labels like "rel=squid,ns=squid-demo-3"
+        def build_label_pred(labels_str):
+          labels_str = labels_str.strip()
+          if not labels_str:
+            return lambda _labels: True
+          pairs = []
+          for part in labels_str.split(","):
+            part = part.strip()
+            if not part:
+              continue
+            if "=" not in part:
+              continue
+            k, v = part.split("=", 1)
+            pairs.append(f"{k}={v}")
+          if not pairs:
+            return lambda _labels: True
+
+          def pred(labels):
+            labels = labels or []
+            for p in pairs:
+              if p not in labels:
+                return False
+            return True
+
+          return pred
+
+        label_pred = build_label_pred(labels_s)
+
+        # ---------- HTTP helper with timing ----------
+        stats = {
+          "artifactinfos": {"calls": 0, "total_time_s": 0.0},
+          "org_components": {"calls": 0, "total_time_s": 0.0},
+          "components": {"calls": 0, "total_time_s": 0.0},
+          "overall_total_time_s": 0.0,
+        }
+
+        def timed_get(kind: str, url: str):
+          headers = {
+            "Authorization": f"Bearer {cb_pat}",
+            "Accept": "application/json",
+          }
+          req = urllib.request.Request(url, headers=headers, method="GET")
+          t0 = time.time()
+          try:
+            with urllib.request.urlopen(req) as resp:
+              body = resp.read()
+              status = resp.getcode()
+          except urllib.error.HTTPError as e:
+            body = e.read()
+            status = e.code
+          t1 = time.time()
+          dt = t1 - t0
+
+          if kind in stats:
+            stats[kind]["calls"] += 1
+            stats[kind]["total_time_s"] += dt
+          stats["overall_total_time_s"] += dt
+
+          log("debug", f"[{kind}] {url} -> status={status} time_s={dt:.3f}")
+          return status, body
+
+        # ---------- Name resolution (optional nicety) ----------
+        def extract_name(data: dict):
+          for path in [
+            ("component", "name"),
+            ("component", "displayName"),
+            ("component", "title"),
+            ("name",),
+            ("displayName",),
+            ("title",),
+          ]:
+            cur = data
+            ok = True
+            for p in path:
+              if isinstance(cur, dict) and p in cur:
+                cur = cur[p]
+              else:
+                ok = False
+                break
+            if ok and isinstance(cur, str) and cur:
+              return cur
+          return ""
+
+        def resolve_component_name(component_id: str, artifact_name: str = "") -> str:
+          # 1) org-scoped component
+          if org_id:
+            url = f"{cb_api_url}/v3/organizations/{org_id}/components/{component_id}"
+            st, body = timed_get("org_components", url)
+            if st == 200:
+              try:
+                data = json.loads(body)
+                n = extract_name(data)
+                if n:
+                  log("debug", f"Name for {component_id} via org_components: {n}")
+                  return n
+              except Exception:
+                pass
+
+          # 2) global component
+          url = f"{cb_api_url}/v3/components/{component_id}"
+          st, body = timed_get("components", url)
+          if st == 200:
+            try:
+              data = json.loads(body)
+              n = extract_name(data)
+              if n:
+                log("debug", f"Name for {component_id} via components: {n}")
+                return n
+            except Exception:
+              pass
+
+          # 3) heuristic from artifact name
+          if artifact_name:
+            tail = artifact_name.split("/")[-1]
+            if tail:
+              log("debug", f"Name for {component_id} via artifact heuristic: {tail}")
+              return tail
+
+          log("debug", f"Name for {component_id} fell back to UUID")
+          return component_id
+
+        # ---------- Main loop ----------
+        manifest = {}
+
+        for logical_name, cfg in components.items():
+          if not isinstance(cfg, dict):
+            log("info", f"Skipping {logical_name}: config is not an object")
+            continue
+
+          component_id = cfg.get("component_id")
+          repo = cfg.get("repo")
+
+          if not component_id or not repo:
+            log("info", f"Skipping {logical_name}: missing component_id or repo")
+            continue
+
+          log("info", f"📦 Resolving artifacts for {logical_name} ({component_id})")
+
+          url = f"{cb_api_url}/v3/components/{component_id}/artifactinfos"
+          st, body = timed_get("artifactinfos", url)
+
+          if st != 200:
+            log("info", f"⚠️ artifactinfos for {component_id} -> {st}; skipping")
+            continue
+
+          try:
+            data = json.loads(body)
+          except Exception as e:
+            log("info", f"⚠️ artifactinfos JSON parse error for {component_id}: {e}")
+            continue
+
+          artifacts = data.get("artifacts") or []
+          if not isinstance(artifacts, list):
+            artifacts = []
+
+          # Filter by labels if provided
+          candidates = [
+            a for a in artifacts
+            if isinstance(a, dict) and label_pred(a.get("labels"))
+          ]
+
+          if not candidates:
+            log("info", f"⚠️ No artifacts matched labels for {logical_name} ({component_id})")
+            continue
+
+          # naive "latest": sort by publishedOn desc if present, else leave as-is
+          def sort_key(a):
+            return a.get("publishedOn") or ""
+
+          candidates.sort(key=sort_key, reverse=True)
+          best = candidates[0]
+
+          artifact_id = str(best.get("id", "n/a"))
+          version = str(best.get("version", "n/a"))
+          digest = str(best.get("digest", "n/a"))
+          artifact_name = str(best.get("name", ""))
+
+          comp_name = resolve_component_name(component_id, artifact_name)
+
+          log(
+            "info",
+            f"  ✔ selected id={artifact_id}, version={version}, digest={digest}, repo={repo}"
+          )
+
+          # Build release-style block
+          manifest[logical_name] = {
+            "deploy": True,
+            "id": component_id,
+            repo: {
+              "deploy": True,
+              "name": repo,
+              "url": f"{repo}:{version}",
+              "version": version,
+              "digest": digest,
+              "id": artifact_id,
+              "component_name": comp_name,
+            },
+          }
+
+        # ---------- Outputs ----------
+        manifest_json = json.dumps(manifest, separators=(",", ":"), sort_keys=True)
+        stats_json = json.dumps(stats, separators=(",", ":"), sort_keys=True)
+
+        # CloudBees composite step outputs
+        outputs_dir = os.environ.get("CLOUDBEES_OUTPUTS") or "."
+        os.makedirs(outputs_dir, exist_ok=True)
+        with open(os.path.join(outputs_dir, "manifest"), "w") as f:
+          f.write(manifest_json)
+        with open(os.path.join(outputs_dir, "stats"), "w") as f:
+          f.write(stats_json)
+
+        # For local debug if needed
+        log("timer", f"📊 STATS: {stats_json}")
+        PY
